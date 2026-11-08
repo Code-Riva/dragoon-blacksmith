@@ -1,0 +1,36 @@
+{
+  "name": "dragoon-token-forge",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint app components lib",
+    "compile": "hardhat compile --config hardhat.config.cjs",
+    "test": "hardhat test --config hardhat.config.cjs",
+    "export-artifacts": "node scripts/export-artifacts.cjs"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "5.6.1",
+    "@tanstack/react-query": "5.66.0",
+    "lucide-react": "^0.475.0",
+    "next": "16.4.3",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "viem": "2.23.5",
+    "wagmi": "2.14.16"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "6.1.2",
+    "@playwright/test": "^1.64.1",
+    "@types/node": "^26.6.6",
+    "autoprefixer": "^10.4.20",
+    "eslint": "9.20.1",
+    "eslint-config-next": "16.4.3",
+    "hardhat": "2.29.1",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17"
+  }
+}

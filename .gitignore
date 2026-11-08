@@ -1,0 +1,61 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Testing and Playwright outputs
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+
+# Next.js Production and Staging Builds
+.next/
+.next_clean/
+out/
+build/
+dist/
+
+# Hardhat compilation and cache artifacts
+cache/
+cache_hardhat/
+artifacts_hardhat/
+
+# Environment Secrets and Local Overrides
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env*.local
+
+# Backups and Temporary Data
+backups/
+*.bak
+*.bak*
+*.backup
+*.old
+*.tmp
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Explicit inclusions for critical reproducibility
+!package-lock.json
+!contracts/
+!test/
+!e2e/
+!scripts/export-artifacts.cjs
+!lib/contracts/ERC20FixedSupply.json

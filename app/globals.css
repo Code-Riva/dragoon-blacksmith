@@ -1,0 +1,76 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-forge-bg: #080706;
+  --color-forge-primary: #f97316;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background-color: #080706;
+  /* Darkened atmospheric transition: #35170D -> #241B0D -> #080706 with ~8% radial flare */
+  background-image: 
+    radial-gradient(ellipse 100% 55% at 50% -10%, rgba(249, 115, 22, 0.08) 0%, transparent 65%),
+    linear-gradient(
+      180deg,
+      #35170D 0%,
+      rgba(53, 23, 13, 0.90) 90px,
+      #241B0D 280px,
+      rgba(36, 27, 13, 0.70) 500px,
+      #140f09 720px,
+      #080706 960px,
+      #080706 100%
+    );
+  background-attachment: fixed;
+  color: #fdfaf7;
+  min-height: 100vh;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Accessibility focus styles using #F97316 */
+:focus-visible {
+  outline: 2px solid #f97316;
+  outline-offset: 2px;
+}
+
+/* Custom scrollbar for ember-orange-to-black aesthetic */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0d0a08;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #33251a;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #523824;
+}
+
+/* Subtle ember selection */
+::selection {
+  background-color: rgba(249, 115, 22, 0.30);
+  color: #fdfaf7;
+}
+
+/* Reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
