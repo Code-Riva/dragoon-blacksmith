@@ -73,14 +73,14 @@ export default function DeploymentModal({
     () => false
   );
 
-  // Helper to obtain client for receipt & verification (uses wallet provider if available, falls back to publicClient)
+  // Helper to obtain client for receipt & verification (uses selected wallet connector provider if available, falls back to publicClient)
   const getTrackingClient = useCallback(async () => {
     try {
       let provider = null;
-      if (typeof window !== "undefined" && window.ethereum) {
-        provider = window.ethereum;
-      } else if (connector && typeof connector.getProvider === "function") {
+      if (connector && typeof connector.getProvider === "function") {
         provider = await connector.getProvider();
+      } else if (typeof window !== "undefined" && window.ethereum) {
+        provider = window.ethereum;
       }
       if (provider && typeof provider.request === "function") {
         return createPublicClient({
@@ -215,6 +215,26 @@ export default function DeploymentModal({
       return;
     }
 
+    // Verify provider's actual chain ID directly to ensure network switch has fully completed
+    if (connector && typeof connector.getProvider === "function") {
+      try {
+        const provider = await connector.getProvider();
+        if (provider && typeof provider.request === "function") {
+          const providerChainIdHex = await provider.request({ method: "eth_chainId" });
+          const providerChainId = parseInt(providerChainIdHex, 16);
+          if (providerChainId !== SEPOLIA_CHAIN_ID) {
+            setErrorMessage(
+              `Wallet is currently on chain ID ${providerChainId} (0x${providerChainId.toString(16)}). Please switch your wallet to Ethereum Sepolia (11155111 / 0xaa36a7) and try again.`
+            );
+            setDeploymentState("failed");
+            return;
+          }
+        }
+      } catch {
+        // Fall back to React state check
+      }
+    }
+
     if (hasParametersChanged) {
       setSnapshot({
         name: name.trim(),
@@ -232,12 +252,16 @@ export default function DeploymentModal({
     setIsConfirmationTimedOut(false);
 
     try {
-      // 1. Dispatch contract creation transaction to connected wallet
+      // 1. Dispatch contract creation transaction to connected wallet with explicit account, value, and pre-calculated gas
       const hash = await deployContractAsync({
         abi: artifact.abi,
         bytecode: artifact.bytecode,
         args: [snapshot.name, snapshot.symbol, BigInt(snapshot.supply)],
         chainId: SEPOLIA_CHAIN_ID,
+        account: address,
+        value: 0n,
+        ...(gasEstimate?.gasLimit ? { gas: gasEstimate.gasLimit } : {}),
+        ...(connector ? { connector } : {}),
       });
 
       setTxHash(hash);
