@@ -158,6 +158,23 @@ test.describe('Token Deployment Flow — Review, Validation & Simulation', () =>
             }
             return '0x0000000000000000000000000000000000000000000000000000000000000000';
           }
+          if (method === 'wallet_watchAsset') {
+            if (window['__rejectWatchAsset']) {
+              const error = new Error('User rejected the request.');
+              error.code = 4001;
+              throw error;
+            }
+            if (window['__unsupportedWatchAsset']) {
+              const error = new Error('Method not supported.');
+              error.code = 4200;
+              throw error;
+            }
+            if (window['__returnFalseWatchAsset']) {
+              return false;
+            }
+            window['__watchAssetParams'] = params;
+            return true;
+          }
           return null;
         },
       };
@@ -234,7 +251,25 @@ test.describe('Token Deployment Flow — Review, Validation & Simulation', () =>
       'https://sepolia.etherscan.io/tx/0x9999999999999999999999999999999999999999999999999999999999999999'
     );
 
-    // 7. Verify "Forge Another Token" button works and resets blueprint
+    // 7. Verify "Add Token to Wallet" button and watchAsset integration
+    const addToWalletButton = page.getByRole('button', { name: /add to wallet/i });
+    await expect(addToWalletButton).toBeVisible();
+    await addToWalletButton.click();
+
+    // Verify button transitions to "In Wallet" and is disabled
+    await expect(page.getByRole('button', { name: /in wallet/i })).toBeVisible();
+    await expect(page.getByRole('button', { name: /in wallet/i })).toBeDisabled();
+
+    // Verify watchAsset params received by mock provider
+    const watchParams = await page.evaluate(() => window['__watchAssetParams']);
+    expect(watchParams).toBeTruthy();
+    expect(watchParams.type).toBe('ERC20');
+    expect(watchParams.options.address).toBe('0x5FbDB2315678afecb367f032d93F642f64180aa3');
+    expect(watchParams.options.symbol).toBe('DRGN');
+    expect(watchParams.options.decimals).toBe(18);
+    expect(watchParams.options.image).toContain('/dragoon-coin.svg');
+
+    // 8. Verify "Forge Another Token" button works and resets blueprint
     const forgeAnotherButton = page.getByRole('button', { name: /forge another token/i });
     await expect(forgeAnotherButton).toBeVisible();
     await forgeAnotherButton.click();
@@ -242,6 +277,58 @@ test.describe('Token Deployment Flow — Review, Validation & Simulation', () =>
     // Verify modal is closed and wallet is still connected
     await expect(page.getByRole('heading', { name: 'Review Token Blueprint' })).not.toBeVisible();
     await expect(page.getByText('0x7099...79C8').first()).toBeVisible();
+  });
+
+  test('handles wallet_watchAsset user rejection and unsupported method gracefully', async ({ page }) => {
+    // 1. Configure watchAsset rejection
+    await page.evaluate(() => {
+      window['__rejectWatchAsset'] = true;
+    });
+
+    // Connect wallet
+    const connectButton = page.getByRole('button', { name: /connect wallet/i });
+    await connectButton.click();
+    await page.locator('button:has-text("MetaMask")').click();
+    await expect(page.getByText('0x7099...79C8').first()).toBeVisible();
+
+    // Open forge modal and confirm
+    const forgeButton = page.getByRole('button', { name: /review & forge token/i });
+    await forgeButton.click();
+    const confirmButton = page.getByRole('button', { name: /confirm & forge/i });
+    await expect(confirmButton).toBeEnabled();
+    await confirmButton.click();
+
+    // Wait for deployment confirmation
+    await expect(page.getByText('Token Successfully Deployed!')).toBeVisible({ timeout: 10000 });
+
+    // Click Add to Wallet
+    const addBtn = page.getByRole('button', { name: /add to wallet/i });
+    await expect(addBtn).toBeVisible();
+    await addBtn.click();
+
+    // Assert rejection notice
+    await expect(page.getByText('Add token request was declined in your wallet.')).toBeVisible();
+
+    // 2. Test unsupported method
+    await page.evaluate(() => {
+      window['__rejectWatchAsset'] = false;
+      window['__unsupportedWatchAsset'] = true;
+    });
+
+    await addBtn.click();
+    await expect(
+      page.getByText(/Your wallet does not support EIP-747 \(wallet_watchAsset\)/i)
+    ).toBeVisible();
+
+    // 3. Test provider returning false without showing success
+    await page.evaluate(() => {
+      window['__unsupportedWatchAsset'] = false;
+      window['__returnFalseWatchAsset'] = true;
+    });
+
+    await addBtn.click();
+    await expect(page.getByText('Token was not added to the wallet.')).toBeVisible();
+    await expect(page.getByRole('button', { name: /in wallet/i })).not.toBeVisible();
   });
 
   test('enforces Sepolia network and disables confirm when on wrong network', async ({ page }) => {

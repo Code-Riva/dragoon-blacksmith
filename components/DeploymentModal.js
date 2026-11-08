@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo, useRef, useSyncExternalStore, useCallback } from "react";
 import { createPortal } from "react-dom";
+import Image from "next/image";
 import { useAccount, useDeployContract, usePublicClient, useSwitchChain } from "wagmi";
 import { sepolia } from "wagmi/chains";
 import { createPublicClient, custom } from "viem";
@@ -61,6 +62,43 @@ export default function DeploymentModal({
   // Clipboard copy state
   const [copiedAddress, setCopiedAddress] = useState(false);
   const [copiedTxHash, setCopiedTxHash] = useState(false);
+
+  // EIP-747 wallet_watchAsset tracking strictly scoped to (contractAddress, address, chainId)
+  const [addingTarget, setAddingTarget] = useState(null);
+  const [watchedTarget, setWatchedTarget] = useState(null);
+  const [watchErrorTarget, setWatchErrorTarget] = useState(null);
+
+  // Derived watch asset states scoped to current active context
+  const isAddingToWallet = Boolean(
+    addingTarget &&
+      contractAddress &&
+      address &&
+      chainId &&
+      addingTarget.contract === contractAddress &&
+      addingTarget.address.toLowerCase() === address.toLowerCase() &&
+      addingTarget.chainId === chainId
+  );
+
+  const watchAssetSuccess = Boolean(
+    watchedTarget &&
+      contractAddress &&
+      address &&
+      chainId &&
+      watchedTarget.contract === contractAddress &&
+      watchedTarget.address.toLowerCase() === address.toLowerCase() &&
+      watchedTarget.chainId === chainId
+  );
+
+  const watchAssetError =
+    watchErrorTarget &&
+    contractAddress &&
+    address &&
+    chainId &&
+    watchErrorTarget.contract === contractAddress &&
+    watchErrorTarget.address.toLowerCase() === address.toLowerCase() &&
+    watchErrorTarget.chainId === chainId
+      ? watchErrorTarget.message
+      : null;
 
   // Modal references
   const modalRef = useRef(null);
@@ -431,8 +469,101 @@ export default function DeploymentModal({
     });
   };
 
+  // Suggest token with custom coin artwork to wallet (EIP-747)
+  const handleAddToWallet = async () => {
+    if (!contractAddress || !snapshot || !address || !chainId) return;
+
+    // Capture context at start of request
+    const contextSnapshot = {
+      contract: contractAddress,
+      address,
+      chainId,
+    };
+
+    setAddingTarget(contextSnapshot);
+    setWatchErrorTarget(null);
+
+    try {
+      let provider = null;
+      if (connector && typeof connector.getProvider === "function") {
+        provider = await connector.getProvider();
+      } else if (typeof window !== "undefined" && window.ethereum) {
+        provider = window.ethereum;
+      }
+
+      if (!provider || typeof provider.request !== "function") {
+        setWatchErrorTarget({
+          ...contextSnapshot,
+          message: "Connected wallet provider is not available.",
+        });
+        setAddingTarget(null);
+        return;
+      }
+
+      // Fully qualified URL pointing to hosted dragoon-coin.svg artwork
+      const imageUrl = `${window.location.origin}/dragoon-coin.svg`;
+
+      const result = await provider.request({
+        method: "wallet_watchAsset",
+        params: {
+          type: "ERC20",
+          options: {
+            address: contractAddress,
+            symbol: snapshot.symbol,
+            decimals: 18,
+            image: imageUrl,
+          },
+        },
+      });
+
+      // Mark as added ONLY when the provider returns strictly true
+      if (result === true) {
+        setWatchedTarget(contextSnapshot);
+        setWatchErrorTarget(null);
+      } else {
+        // Handle false without showing success
+        setWatchErrorTarget({
+          ...contextSnapshot,
+          message: "Token was not added to the wallet.",
+        });
+      }
+    } catch (err) {
+      const isRejected =
+        err?.code === 4001 ||
+        err?.name === "UserRejectedRequestError" ||
+        err?.message?.toLowerCase().includes("rejected") ||
+        err?.message?.toLowerCase().includes("denied");
+
+      let errorMsg;
+      if (isRejected) {
+        errorMsg = "Add token request was declined in your wallet.";
+      } else if (
+        err?.code === 4200 ||
+        err?.code === -32601 ||
+        err?.name === "MethodNotFoundRpcError" ||
+        err?.name === "MethodNotSupportedRpcError" ||
+        err?.message?.toLowerCase().includes("not supported")
+      ) {
+        errorMsg =
+          "Your wallet does not support EIP-747 (wallet_watchAsset). You can import the token manually using its contract address.";
+      } else {
+        errorMsg = err?.shortMessage || err?.message || "Failed to add token to wallet.";
+      }
+
+      setWatchErrorTarget({
+        ...contextSnapshot,
+        message: errorMsg,
+      });
+    } finally {
+      setAddingTarget(null);
+    }
+  };
+
   // Reset blueprint and start fresh
   const handleForgeAnother = () => {
+    setWatchedTarget(null);
+    setWatchErrorTarget(null);
+    setAddingTarget(null);
     if (onResetBlueprint) onResetBlueprint();
     onClose();
   };
@@ -826,6 +957,64 @@ export default function DeploymentModal({
                         <line x1="10" y1="14" x2="21" y2="3" />
                       </svg>
                     </a>
+                  )}
+                </div>
+
+                {/* Add Token to Wallet (EIP-747 wallet_watchAsset) */}
+                <div className="p-3.5 rounded-xl bg-forge-surfaceElevated border border-forge-border text-xs space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="w-8 h-8 rounded-full bg-orange-950/40 border border-orange-500/40 flex items-center justify-center flex-shrink-0 overflow-hidden">
+                        <Image
+                          src="/dragoon-coin.svg"
+                          alt=""
+                          width={26}
+                          height={26}
+                          aria-hidden="true"
+                        />
+                      </div>
+                      <div className="min-w-0 text-left">
+                        <span className="font-semibold text-forge-textPrimary block truncate">Add Token to Wallet</span>
+                        <span className="text-[11px] text-forge-textSecondary block">
+                          Track {snapshot.symbol} with coin artwork via EIP-747
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleAddToWallet}
+                      disabled={isAddingToWallet || watchAssetSuccess}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 flex-shrink-0 ${
+                        watchAssetSuccess
+                          ? "bg-emerald-950/60 border border-emerald-500/50 text-emerald-300"
+                          : "bg-orange-500 hover:bg-orange-600 text-white shadow-sm cursor-pointer"
+                      }`}
+                    >
+                      {watchAssetSuccess ? (
+                        <>
+                          <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                            <polyline points="20 6 9 17 4 12" />
+                          </svg>
+                          <span>In Wallet</span>
+                        </>
+                      ) : isAddingToWallet ? (
+                        <span>Adding...</span>
+                      ) : (
+                        <>
+                          <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+                            <polyline points="17 21 17 13 7 13 7 21" />
+                            <polyline points="7 3 7 8 15 8" />
+                          </svg>
+                          <span>Add to Wallet</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                  {watchAssetError && (
+                    <p className="text-[11px] text-orange-400/90 pt-1 border-t border-forge-border text-left">
+                      {watchAssetError}
+                    </p>
                   )}
                 </div>
               </div>
