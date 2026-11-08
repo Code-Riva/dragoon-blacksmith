@@ -8,9 +8,13 @@ test.describe('Token Deployment Flow — Review, Validation & Simulation', () =>
 
     await page.addInitScript(() => {
       window['__deployRequests'] = [];
+      window['__sentTransactions'] = [];
       window['__rejectDeployment'] = false;
       window['__revertDeployment'] = false;
       window['__stayOnWrongChain'] = false;
+      window['__noAuthorizedAccounts'] = false;
+      window['__customAccounts'] = null;
+      window['__activeAccount'] = null;
       window['__chainId'] = '0xaa36a7'; // Sepolia (11155111)
 
       const DEPLOYER_ADDRESS = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
@@ -44,8 +48,20 @@ test.describe('Token Deployment Flow — Review, Validation & Simulation', () =>
         request: async ({ method, params }) => {
           window['__deployRequests'].push({ method, params });
 
-          if (method === 'eth_requestAccounts' || method === 'eth_accounts') {
-            return [DEPLOYER_ADDRESS];
+          if (method === 'eth_requestAccounts') {
+            if (window['__noAuthorizedAccounts']) {
+              return [];
+            }
+            return [window['__activeAccount'] || DEPLOYER_ADDRESS];
+          }
+          if (method === 'eth_accounts') {
+            if (window['__noAuthorizedAccounts']) {
+              return [];
+            }
+            if (window['__customAccounts']) {
+              return window['__customAccounts'];
+            }
+            return [window['__activeAccount'] || DEPLOYER_ADDRESS];
           }
           if (method === 'eth_chainId') {
             return window['__chainId'];
@@ -67,7 +83,11 @@ test.describe('Token Deployment Flow — Review, Validation & Simulation', () =>
               number: '0x105',
               hash: '0x1234567890123456789012345678901234567890123456789012345678901234',
               timestamp: '0x654321',
+              baseFeePerGas: '0x3b9aca00',
             };
+          }
+          if (method === 'eth_maxPriorityFeePerGas') {
+            return '0x59682f00';
           }
           if (method === 'eth_estimateGas') {
             return '0x138800'; // ~1,280,000 gas
@@ -87,6 +107,7 @@ test.describe('Token Deployment Flow — Review, Validation & Simulation', () =>
             return null;
           }
           if (method === 'eth_sendTransaction') {
+            window['__sentTransactions'].push(params?.[0]);
             if (window['__rejectDeployment']) {
               const err = new Error('User rejected the transaction.');
               // @ts-ignore
@@ -418,5 +439,195 @@ test.describe('Token Deployment Flow — Review, Validation & Simulation', () =>
     await expect(
       page.getByText(/Transaction was reverted on-chain by the Ethereum Sepolia network/i)
     ).toBeVisible({ timeout: 10000 });
+  });
+
+  test('unchanged-account submission succeeds with multi-account authorized provider', async ({ page }) => {
+    // 1. Configure provider to return multiple authorized accounts with reviewed account at index 1
+    const SECONDARY_ACCOUNT = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC';
+    const PRIMARY_ACCOUNT = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
+    await page.evaluate(({ secondary, primary }) => {
+      window['__customAccounts'] = [secondary, primary];
+      window['__activeAccount'] = primary;
+    }, { secondary: SECONDARY_ACCOUNT, primary: PRIMARY_ACCOUNT });
+
+    // 2. Connect wallet
+    const connectButton = page.getByRole('button', { name: /connect wallet/i });
+    await connectButton.click();
+    await page.locator('button:has-text("MetaMask")').click();
+    await expect(page.getByText('0x7099...79C8').first()).toBeVisible();
+
+    // 3. Open forge modal
+    const forgeButton = page.getByRole('button', { name: /review & forge token/i });
+    await forgeButton.click();
+
+    // 4. Confirm & Forge
+    const confirmButton = page.getByRole('button', { name: /confirm & forge/i });
+    await expect(confirmButton).toBeEnabled();
+    await confirmButton.click();
+
+    // 5. Verify deployment successfully completes
+    await expect(page.getByText('Token Successfully Deployed!')).toBeVisible({ timeout: 10000 });
+
+    // 6. Verify outgoing transaction had exact reviewed from account
+    const sentTx = await page.evaluate(() => window['__sentTransactions']);
+    expect(sentTx.length).toBe(1);
+    expect(sentTx[0].from.toLowerCase()).toBe(PRIMARY_ACCOUNT.toLowerCase());
+  });
+
+  test('invalidates review and prevents silent substitution when account changes while modal is open', async ({ page }) => {
+    const ACCOUNT_A = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
+    const ACCOUNT_B = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC';
+
+    // 1. Connect wallet with Account A
+    const connectButton = page.getByRole('button', { name: /connect wallet/i });
+    await connectButton.click();
+    await page.locator('button:has-text("MetaMask")').click();
+    await expect(page.getByText('0x7099...79C8').first()).toBeVisible();
+
+    // 2. Open forge modal (review captures Account A)
+    const forgeButton = page.getByRole('button', { name: /review & forge token/i });
+    await forgeButton.click();
+
+    const modal = page.locator('div[role="dialog"]');
+    await expect(modal.getByText('0x709979...dc79C8')).toBeVisible();
+
+    // 3. Switch account in wallet while modal is open
+    await page.evaluate((newAccount) => {
+      window['__activeAccount'] = newAccount;
+      window['__customAccounts'] = [newAccount];
+      // @ts-ignore
+      window['__mockProvider'].emit('accountsChanged', [newAccount]);
+    }, ACCOUNT_B);
+
+    // 4. Assert "Wallet Context Changed" notice appears in the modal
+    await expect(modal.getByText('Wallet Context Changed')).toBeVisible();
+
+    // 5. Click "Confirm & Forge" - MUST NOT dispatch transaction, MUST invalidate review
+    const confirmButton = page.getByRole('button', { name: /confirm & forge/i });
+    await confirmButton.click();
+
+    // Verify ZERO transactions were dispatched
+    const sentCountBefore = await page.evaluate(() => window['__sentTransactions'].length);
+    expect(sentCountBefore).toBe(0);
+
+    // Verify notice disappears and reviewed recipient updates to Account B
+    await expect(modal.getByText('Wallet Context Changed')).not.toBeVisible();
+    await expect(modal.getByText('0x3C44Cd...4293BC')).toBeVisible();
+
+    // 6. Explicitly confirm with the updated reviewed account
+    await confirmButton.click();
+
+    // Verify deployment succeeds with Account B as sender
+    await expect(page.getByText('Token Successfully Deployed!')).toBeVisible({ timeout: 10000 });
+    const sentTx = await page.evaluate(() => window['__sentTransactions']);
+    expect(sentTx.length).toBe(1);
+    expect(sentTx[0].from.toLowerCase()).toBe(ACCOUNT_B.toLowerCase());
+  });
+
+  test('blocks deployment when provider returns missing authorization or unauthorized account', async ({ page }) => {
+    // 1. Connect wallet
+    const connectButton = page.getByRole('button', { name: /connect wallet/i });
+    await connectButton.click();
+    await page.locator('button:has-text("MetaMask")').click();
+    await expect(page.getByText('0x7099...79C8').first()).toBeVisible();
+
+    // 2. Open forge modal
+    const forgeButton = page.getByRole('button', { name: /review & forge token/i });
+    await forgeButton.click();
+
+    // 3. Simulate wallet provider returning no authorized accounts (locked wallet)
+    await page.evaluate(() => {
+      window['__noAuthorizedAccounts'] = true;
+    });
+
+    // 4. Attempt to confirm
+    const confirmButton = page.getByRole('button', { name: /confirm & forge/i });
+    await confirmButton.click();
+
+    // 5. Assert authorization error banner is displayed and no tx was sent
+    await expect(
+      page.getByText(/No authorized accounts returned by the connected wallet provider/i)
+    ).toBeVisible();
+
+    const sentCount = await page.evaluate(() => window['__sentTransactions'].length);
+    expect(sentCount).toBe(0);
+  });
+
+  test('blocks deployment when eth_accounts returns a nonempty list that excludes the reviewed sender', async ({ page }) => {
+    const REVIEWED_ACCOUNT = '0x70997970C51812dc3A010C7d01b50e0d17dc79C8';
+    const UNAUTHORIZED_ACCOUNT = '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC';
+
+    // 1. Connect wallet with REVIEWED_ACCOUNT
+    const connectButton = page.getByRole('button', { name: /connect wallet/i });
+    await connectButton.click();
+    await page.locator('button:has-text("MetaMask")').click();
+    await expect(page.getByText('0x7099...79C8').first()).toBeVisible();
+
+    // 2. Open forge modal
+    const forgeButton = page.getByRole('button', { name: /review & forge token/i });
+    await forgeButton.click();
+    await expect(page.getByRole('button', { name: /confirm & forge/i })).toBeEnabled();
+
+    // 3. Provider returns a non-empty list that excludes the reviewed sender
+    await page.evaluate(({ unauthorized }) => {
+      window['__customAccounts'] = [unauthorized];
+    }, { unauthorized: UNAUTHORIZED_ACCOUNT });
+
+    // 4. Click confirm & forge
+    const confirmButton = page.getByRole('button', { name: /confirm & forge/i });
+    await confirmButton.click();
+
+    // 5. Verify deployment is blocked with unauthorized sender message
+    await expect(
+      page.getByText(/is not among the authorized accounts in your connected wallet/i)
+    ).toBeVisible();
+
+    // 6. Verify zero transactions were dispatched
+    const sentCount = await page.evaluate(() => window['__sentTransactions'].length);
+    expect(sentCount).toBe(0);
+  });
+
+  test('captures comprehensive preflight diagnostics via opt-in UI and global window helper', async ({ page }) => {
+    // 1. Connect wallet
+    const connectButton = page.getByRole('button', { name: /connect wallet/i });
+    await connectButton.click();
+    await page.locator('button:has-text("MetaMask")').click();
+    await expect(page.getByText('0x7099...79C8').first()).toBeVisible();
+
+    // 2. Open forge modal
+    const forgeButton = page.getByRole('button', { name: /review & forge token/i });
+    await forgeButton.click();
+
+    // 3. Trigger opt-in diagnostics via UI
+    const diagnosticsButton = page.getByRole('button', { name: /run preflight diagnostics/i });
+    await expect(diagnosticsButton).toBeVisible();
+    await diagnosticsButton.click();
+
+    // 4. Verify UI diagnostics panel rendered observed vs estimated sections
+    await expect(page.getByText('Preflight Diagnostics')).toBeVisible();
+    await expect(page.getByText('Observed Parameters')).toBeVisible();
+    await expect(page.getByText('Simulation & Estimates')).toBeVisible();
+    await expect(page.getByText(/eth_call: SUCCESS/i)).toBeVisible();
+    await expect(page.getByText(/eth_estimateGas: SUCCESS/i)).toBeVisible();
+
+    // 5. Verify programmatic capture via window.__dragoonCaptureDiagnostics()
+    const report = await page.evaluate(async () => {
+      return await window['__dragoonCaptureDiagnostics']();
+    });
+
+    expect(report).toBeTruthy();
+    expect(report._securityNotice).toContain('SAFE DIAGNOSTIC');
+    expect(report.network.providerChainId).toBe(11155111);
+    expect(report.accounts.reviewedSender.toLowerCase()).toBe('0x70997970c51812dc3a010c7d01b50e0d17dc79c8');
+    expect(report.accounts.isSenderConsistent).toBe(true);
+    expect(report.accounts.isReviewedAccountAuthorized).toBe(true);
+    expect(report.deploymentPayload.data).toBeTruthy();
+    expect(report.deploymentPayload.to).toBeNull();
+    expect(report.deploymentPayload.value).toBe('0x0');
+    expect(report.observedBalance.balanceEth).toBe('1');
+    expect(report.observedFeeParameters.gasPriceGwei).toBeTruthy();
+    expect(report.freshRpcSimulations.eth_call.status).toBe('SUCCESS');
+    expect(report.freshRpcSimulations.eth_estimateGas.status).toBe('SUCCESS');
+    expect(report.feeAnalysis.balanceSufficiency.hasSufficientFundsForGas).toBe(true);
   });
 });

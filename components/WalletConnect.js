@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, useRef, useTransition, useSyncExternalStore } from "react";
+import { useState, useEffect, useMemo, useRef, useTransition, useSyncExternalStore, useCallback } from "react";
 import { createPortal } from "react-dom";
 import Image from "next/image";
 import {
@@ -20,6 +20,7 @@ import {
   getLegacyProviderForRdns,
   isInsecureContext,
 } from "@/lib/eip6963";
+import { subscribePendingTx, getHasPendingTx } from "@/lib/pendingTransactions";
 
 export default function WalletConnect() {
   const { address, isConnected, connector: activeConnector, chainId: accountChainId } = useAccount();
@@ -27,11 +28,13 @@ export default function WalletConnect() {
   const chainId = accountChainId ?? configChainId;
   const { connect, connectors, isPending: isConnectPending, reset: resetConnect } =
     useConnect();
-  const { disconnect } = useDisconnect();
+  const { disconnect, disconnectAsync } = useDisconnect();
   const { switchChain, isPending: isSwitchPending } = useSwitchChain();
 
   const [isPickerOpen, setIsPickerOpen] = useState(false);
   const [isDetailsOpen, setIsDetailsOpen] = useState(false);
+  const [isDisconnectConfirmOpen, setIsDisconnectConfirmOpen] = useState(false);
+  const [isDisconnecting, setIsDisconnecting] = useState(false);
   const [announcedProviders, setAnnouncedProviders] = useState([]);
   const [selectedWalletRdns, setSelectedWalletRdns] = useState(null);
   const [copied, setCopied] = useState(false);
@@ -43,6 +46,9 @@ export default function WalletConnect() {
   const closeButtonRef = useRef(null);
   const modalRef = useRef(null);
   const detailsRef = useRef(null);
+  const disconnectTriggerRef = useRef(null);
+  const keepConnectedButtonRef = useRef(null);
+  const disconnectModalRef = useRef(null);
 
   // Client mounting tracking for Portal via useSyncExternalStore
   const mounted = useSyncExternalStore(
@@ -55,6 +61,13 @@ export default function WalletConnect() {
   const isInsecure = useSyncExternalStore(
     () => () => {},
     () => isInsecureContext(),
+    () => false
+  );
+
+  // External subscription for tracking pending blockchain transactions
+  const hasPendingTransaction = useSyncExternalStore(
+    subscribePendingTx,
+    getHasPendingTx,
     () => false
   );
 
@@ -116,9 +129,53 @@ export default function WalletConnect() {
     }, 0);
   };
 
-  // Lock background body scrolling when picker is open & restore on close
+  // Open disconnect confirmation dialog without disconnecting
+  const handleOpenDisconnectConfirm = (e) => {
+    disconnectTriggerRef.current = e?.currentTarget || null;
+    setIsDetailsOpen(false);
+    setIsDisconnectConfirmOpen(true);
+  };
+
+  // Dismiss disconnect confirmation without disconnecting and restore focus
+  const handleDismissDisconnectConfirm = useCallback(() => {
+    setIsDisconnectConfirmOpen(false);
+    setIsDisconnecting(false);
+    setTimeout(() => {
+      if (triggerRef.current && document.body.contains(triggerRef.current)) {
+        triggerRef.current.focus();
+      }
+    }, 0);
+  }, []);
+
+  // Explicit confirmation calls existing disconnect handler
+  const handleConfirmDisconnect = useCallback(async () => {
+    if (isDisconnecting) return;
+    setIsDisconnecting(true);
+    try {
+      if (disconnectAsync) {
+        await disconnectAsync();
+      } else {
+        disconnect();
+      }
+    } catch {
+      // Disconnect errors are non-blocking
+    } finally {
+      setIsDisconnecting(false);
+      setIsDisconnectConfirmOpen(false);
+      setIsDetailsOpen(false);
+      setSelectedWalletRdns(null);
+      setUiError(null);
+      setTimeout(() => {
+        if (triggerRef.current && document.body.contains(triggerRef.current)) {
+          triggerRef.current.focus();
+        }
+      }, 0);
+    }
+  }, [disconnect, disconnectAsync, isDisconnecting]);
+
+  // Lock background body scrolling when picker or disconnect dialog is open & restore on close
   useEffect(() => {
-    if (isPickerOpen) {
+    if (isPickerOpen || isDisconnectConfirmOpen) {
       const originalOverflow = document.body.style.overflow;
       const originalPaddingRight = document.body.style.paddingRight;
       const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
@@ -131,7 +188,7 @@ export default function WalletConnect() {
         document.body.style.paddingRight = originalPaddingRight;
       };
     }
-  }, [isPickerOpen]);
+  }, [isPickerOpen, isDisconnectConfirmOpen]);
 
   // Focus containment (trap) & initial focus when dialog opens
   useEffect(() => {
@@ -164,21 +221,64 @@ export default function WalletConnect() {
     return () => modal.removeEventListener("keydown", handleTabKey);
   }, [isPickerOpen]);
 
+  // Initial focus on "Keep Connected" button
+  useEffect(() => {
+    if (!isDisconnectConfirmOpen) return;
+    const timer = setTimeout(() => {
+      keepConnectedButtonRef.current?.focus();
+    }, 20);
+    return () => clearTimeout(timer);
+  }, [isDisconnectConfirmOpen]);
+
+  // Trap focus inside disconnect confirmation dialog
+  useEffect(() => {
+    if (!isDisconnectConfirmOpen) return;
+    const modal = disconnectModalRef.current;
+    if (!modal) return;
+
+    const handleTabKey = (e) => {
+      if (e.key !== "Tab") return;
+      const focusable = modal.querySelectorAll(
+        'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+
+    modal.addEventListener("keydown", handleTabKey);
+    return () => modal.removeEventListener("keydown", handleTabKey);
+  }, [isDisconnectConfirmOpen]);
+
   // Close modals on Escape key
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === "Escape") {
+        if (isDisconnectConfirmOpen) {
+          handleDismissDisconnectConfirm();
+          return;
+        }
         if (isPickerOpen) {
           handleClosePicker();
+          return;
         }
         if (isDetailsOpen) {
           setIsDetailsOpen(false);
+          return;
         }
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isPickerOpen, isDetailsOpen]);
+  }, [isDisconnectConfirmOpen, isPickerOpen, isDetailsOpen, handleDismissDisconnectConfirm]);
 
   // Close details dropdown on outside click
   useEffect(() => {
@@ -314,14 +414,6 @@ export default function WalletConnect() {
     startBalanceTransition(async () => {
       await refetchBalance();
     });
-  };
-
-  // Disconnect handler
-  const handleDisconnect = () => {
-    disconnect();
-    setIsDetailsOpen(false);
-    setSelectedWalletRdns(null);
-    setUiError(null);
   };
 
   // Render wallet icon
@@ -621,7 +713,7 @@ export default function WalletConnect() {
                   </a>
                   <button
                     type="button"
-                    onClick={handleDisconnect}
+                    onClick={handleOpenDisconnectConfirm}
                     className="px-3 py-1 rounded-lg border border-red-500/40 bg-red-950/20 hover:bg-red-900/40 text-red-400 text-xs font-semibold transition-colors"
                   >
                     Disconnect
@@ -825,6 +917,92 @@ export default function WalletConnect() {
                 {/* Modal Footer Note: Pinned at bottom */}
                 <div className="mt-3 pt-3 border-t border-forge-border text-center text-xs text-forge-textMuted flex-shrink-0">
                   <span>Connecting does not move funds.</span>
+                </div>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+
+      {/* =========================================================================
+          DISCONNECT CONFIRMATION DIALOG (PORTAL)
+          Rendered through document.body to avoid header/layout clipping contexts.
+         ========================================================================= */}
+      {mounted &&
+        isConnected &&
+        isDisconnectConfirmOpen &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-[110] overflow-y-auto bg-black/80 backdrop-blur-sm"
+            onClick={(e) => {
+              if (e.target === e.currentTarget && !isDisconnecting) {
+                handleDismissDisconnectConfirm();
+              }
+            }}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="disconnect-dialog-title"
+            aria-describedby="disconnect-dialog-desc"
+          >
+            <div
+              className="flex min-h-full items-center justify-center p-4 text-center"
+              onClick={(e) => {
+                if (e.target === e.currentTarget && !isDisconnecting) {
+                  handleDismissDisconnectConfirm();
+                }
+              }}
+            >
+              <div
+                ref={disconnectModalRef}
+                onClick={(e) => e.stopPropagation()}
+                className="w-full max-w-md flex flex-col rounded-2xl bg-forge-surface border border-forge-border p-5 sm:p-6 shadow-2xl text-left my-auto animate-in fade-in zoom-in-95 duration-150 relative"
+              >
+                {/* Dialog Icon & Header */}
+                <div className="flex items-start gap-3.5">
+                  <div className="w-10 h-10 rounded-full bg-amber-950/40 border border-amber-500/40 flex items-center justify-center text-amber-400 flex-shrink-0 mt-0.5">
+                    <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+                      <line x1="12" y1="2" x2="12" y2="12" />
+                    </svg>
+                  </div>
+                  <div className="flex-1">
+                    <h3
+                      id="disconnect-dialog-title"
+                      className="text-base sm:text-lg font-bold text-forge-textPrimary tracking-tight"
+                    >
+                      Disconnect wallet?
+                    </h3>
+                    <div
+                      id="disconnect-dialog-desc"
+                      className="mt-1.5 text-xs sm:text-sm text-forge-textSecondary leading-relaxed space-y-1"
+                    >
+                      <p>You can reconnect anytime.</p>
+                      {hasPendingTransaction && (
+                        <p>Your submitted transaction will continue.</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Actions */}
+                <div className="mt-6 flex items-center justify-end gap-3 pt-3 border-t border-forge-border/40">
+                  <button
+                    ref={keepConnectedButtonRef}
+                    type="button"
+                    onClick={handleDismissDisconnectConfirm}
+                    disabled={isDisconnecting}
+                    className="px-4 py-2 rounded-xl border border-forge-border hover:bg-forge-surfaceElevated text-xs font-semibold text-forge-textSecondary hover:text-forge-textPrimary transition-colors focus:outline-none focus:ring-2 focus:ring-orange-500"
+                  >
+                    Keep Connected
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleConfirmDisconnect}
+                    disabled={isDisconnecting}
+                    className="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-700 text-white font-semibold text-xs transition-colors shadow-md focus:outline-none focus:ring-2 focus:ring-red-500 flex items-center gap-1.5"
+                  >
+                    {isDisconnecting ? "Disconnecting..." : "Disconnect"}
+                  </button>
                 </div>
               </div>
             </div>

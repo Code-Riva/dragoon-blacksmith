@@ -15,8 +15,10 @@ import {
   estimateDeploymentGas,
   verifyDeployedToken,
 } from "@/lib/tokenDeployment";
+import { captureDeploymentDiagnostics } from "@/lib/diagnosticCapture";
 import { formatBigIntWithCommas, getSupplyScaleLabel } from "@/lib/formatters";
 import { TOKEN_DECIMALS } from "@/lib/tokenValidation";
+import { trackPendingTransaction, markTransactionSettled } from "@/lib/pendingTransactions";
 
 /**
  * DeploymentModal:
@@ -37,7 +39,9 @@ export default function DeploymentModal({
   const { switchChain, isPending: isSwitchPending } = useSwitchChain();
   const { deployContractAsync } = useDeployContract();
 
-  // Snapshot of parameters captured on modal mount
+  const currentConnectorId = connector?.id || connector?.name || null;
+
+  // Snapshot of parameters captured on modal mount or review refresh
   const [snapshot, setSnapshot] = useState(() => ({
     name: name.trim(),
     symbol: symbol.trim().toUpperCase(),
@@ -45,6 +49,7 @@ export default function DeploymentModal({
     supplyBigInt,
     address,
     chainId,
+    connectorId: currentConnectorId,
   }));
 
   // Flow State: 'ready' | 'awaiting-approval' | 'forging' | 'confirmed' | 'failed'
@@ -100,6 +105,12 @@ export default function DeploymentModal({
       ? watchErrorTarget.message
       : null;
 
+  // Temporary opt-in diagnostic capture
+  const [diagnosticsReport, setDiagnosticsReport] = useState(null);
+  const [isCapturingDiagnostics, setIsCapturingDiagnostics] = useState(false);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [copiedDiagnostics, setCopiedDiagnostics] = useState(false);
+
   // Modal references
   const modalRef = useRef(null);
   const closeButtonRef = useRef(null);
@@ -133,17 +144,29 @@ export default function DeploymentModal({
     return publicClient;
   }, [connector, publicClient]);
 
-  // Check if reviewed parameters or wallet changed while modal was open
+  // Check if wallet context (account, network, or connector) changed while review was open
+  const isWalletContextChanged = useMemo(() => {
+    if (!snapshot) return false;
+    const isDisconnected = Boolean(!isConnected || !address);
+    const isAccountChanged = Boolean(
+      address && snapshot.address && address.toLowerCase() !== snapshot.address.toLowerCase()
+    );
+    const isNetworkChanged = chainId !== snapshot.chainId;
+    const isConnectorChanged = currentConnectorId !== snapshot.connectorId;
+    return isDisconnected || isAccountChanged || isNetworkChanged || isConnectorChanged;
+  }, [snapshot, isConnected, address, chainId, currentConnectorId]);
+
+  // Check if reviewed token blueprint parameters changed while modal was open
   const hasParametersChanged = useMemo(() => {
     if (!snapshot) return false;
     return (
       name.trim() !== snapshot.name ||
       symbol.trim().toUpperCase() !== snapshot.symbol ||
-      supply.trim() !== snapshot.supply ||
-      address !== snapshot.address ||
-      chainId !== snapshot.chainId
+      supply.trim() !== snapshot.supply
     );
-  }, [snapshot, name, symbol, supply, address, chainId]);
+  }, [snapshot, name, symbol, supply]);
+
+  const isReviewInvalid = isWalletContextChanged || hasParametersChanged;
 
   // Gas estimation query using TanStack React Query (no setState in useEffect)
   const {
@@ -157,11 +180,11 @@ export default function DeploymentModal({
       snapshot?.name,
       snapshot?.symbol,
       snapshot?.supply,
-      address,
-      chainId,
+      snapshot?.address,
+      snapshot?.chainId,
     ],
     queryFn: async () => {
-      if (!address || !snapshot) return null;
+      if (!snapshot?.address || !snapshot) return null;
       const client = await getTrackingClient();
       if (!client) return null;
       return estimateDeploymentGas({
@@ -169,15 +192,16 @@ export default function DeploymentModal({
         name: snapshot.name,
         symbol: snapshot.symbol,
         supplyWhole: snapshot.supply,
-        account: address,
+        account: snapshot.address,
       });
     },
     enabled: Boolean(
       isOpen &&
         snapshot &&
-        address &&
-        chainId === SEPOLIA_CHAIN_ID &&
-        deploymentState === "ready"
+        snapshot.address &&
+        snapshot.chainId === SEPOLIA_CHAIN_ID &&
+        deploymentState === "ready" &&
+        !isReviewInvalid
     ),
     staleTime: 30_000,
     retry: false,
@@ -228,8 +252,8 @@ export default function DeploymentModal({
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === "Escape" && isOpen) {
-        // Prevent accidental closing while awaiting approval or waiting for receipt
-        if (deploymentState === "awaiting-approval" || deploymentState === "forging") {
+        // Prevent closing only while awaiting wallet signature in external extension
+        if (deploymentState === "awaiting-approval") {
           return;
         }
         onClose();
@@ -253,11 +277,29 @@ export default function DeploymentModal({
       return;
     }
 
-    // Verify provider's actual chain ID directly to ensure network switch has fully completed
+    // 1. Invalidate review if account, connector, network, or form parameters changed
+    if (isReviewInvalid) {
+      setSnapshot({
+        name: name.trim(),
+        symbol: symbol.trim().toUpperCase(),
+        supply: supply.trim(),
+        supplyBigInt,
+        address,
+        chainId,
+        connectorId: currentConnectorId,
+      });
+      setErrorMessage(null);
+      // Invalidate review: halts without deploying to require a fresh review with the updated context. Never silently substitutes another sender.
+      return;
+    }
+
+    // 2. Preflight query: Verify provider's actual chain ID and authorized accounts directly from the selected provider
+    let providerAccounts = null;
     if (connector && typeof connector.getProvider === "function") {
       try {
         const provider = await connector.getProvider();
         if (provider && typeof provider.request === "function") {
+          // Preflight chain check
           const providerChainIdHex = await provider.request({ method: "eth_chainId" });
           const providerChainId = parseInt(providerChainIdHex, 16);
           if (providerChainId !== SEPOLIA_CHAIN_ID) {
@@ -267,22 +309,45 @@ export default function DeploymentModal({
             setDeploymentState("failed");
             return;
           }
+
+          // Preflight accounts check
+          providerAccounts = await provider.request({ method: "eth_accounts" });
         }
       } catch {
         // Fall back to React state check
       }
     }
 
-    if (hasParametersChanged) {
-      setSnapshot({
-        name: name.trim(),
-        symbol: symbol.trim().toUpperCase(),
-        supply: supply.trim(),
-        supplyBigInt,
-        address,
-        chainId,
-      });
+    // 3. Confirm account consistency: reviewed account, current connected account, and provider-authorized accounts
+    if (!snapshot.address || address.toLowerCase() !== snapshot.address.toLowerCase()) {
+      setErrorMessage(
+        `Sender account mismatch: active connected account (${address}) does not match the reviewed sender account (${snapshot?.address || "none"}). Review has been invalidated.`
+      );
+      setDeploymentState("failed");
       return;
+    }
+
+    if (providerAccounts !== null) {
+      if (!Array.isArray(providerAccounts) || providerAccounts.length === 0) {
+        setErrorMessage(
+          "No authorized accounts returned by the connected wallet provider. Please ensure your wallet is unlocked and connected."
+        );
+        setDeploymentState("failed");
+        return;
+      }
+
+      // Confirm reviewed account is authorized (do not assume the first returned account is the only authorized account)
+      const isReviewedAccountAuthorized = providerAccounts.some(
+        (acc) => typeof acc === "string" && acc.toLowerCase() === snapshot.address.toLowerCase()
+      );
+
+      if (!isReviewedAccountAuthorized) {
+        setErrorMessage(
+          `Reviewed sender account (${snapshot.address}) is not among the authorized accounts in your connected wallet. Please select this account in your wallet or re-review with an authorized account.`
+        );
+        setDeploymentState("failed");
+        return;
+      }
     }
 
     setDeploymentState("awaiting-approval");
@@ -290,13 +355,13 @@ export default function DeploymentModal({
     setIsConfirmationTimedOut(false);
 
     try {
-      // 1. Dispatch contract creation transaction to connected wallet with explicit account, value, and pre-calculated gas
+      // 4. Dispatch contract creation transaction to connected wallet with explicit account, value, and pre-calculated gas
       const hash = await deployContractAsync({
         abi: artifact.abi,
         bytecode: artifact.bytecode,
         args: [snapshot.name, snapshot.symbol, BigInt(snapshot.supply)],
         chainId: SEPOLIA_CHAIN_ID,
-        account: address,
+        account: snapshot.address,
         value: 0n,
         ...(gasEstimate?.gasLimit ? { gas: gasEstimate.gasLimit } : {}),
         ...(connector ? { connector } : {}),
@@ -305,8 +370,14 @@ export default function DeploymentModal({
       setTxHash(hash);
       setDeploymentState("forging");
 
-      // 2. Track transaction receipt on Sepolia
+      // 2. Track transaction receipt on Sepolia and register pending transaction
       const trackingClient = await getTrackingClient();
+      trackPendingTransaction({
+        chainId: SEPOLIA_CHAIN_ID,
+        hash,
+        publicClient: trackingClient,
+      });
+
       try {
         const receipt = await trackingClient.waitForTransactionReceipt({
           hash,
@@ -316,6 +387,12 @@ export default function DeploymentModal({
 
         if (receipt.status === "reverted") {
           setDeploymentState("failed");
+          markTransactionSettled({
+            chainId: SEPOLIA_CHAIN_ID,
+            hash,
+            status: "reverted",
+            receipt,
+          });
           setErrorMessage(
             "Transaction was reverted on-chain by the Ethereum Sepolia network. Gas was consumed but the contract was not deployed."
           );
@@ -325,12 +402,24 @@ export default function DeploymentModal({
         const deployed = receipt.contractAddress;
         if (!deployed) {
           setDeploymentState("failed");
+          markTransactionSettled({
+            chainId: SEPOLIA_CHAIN_ID,
+            hash,
+            status: receipt.status || "success",
+            receipt,
+          });
           setErrorMessage("Receipt confirmed, but contract address was not returned by the network.");
           return;
         }
 
         setDeployedAddress(deployed);
         setDeploymentState("confirmed");
+        markTransactionSettled({
+          chainId: SEPOLIA_CHAIN_ID,
+          hash,
+          status: "success",
+          receipt,
+        });
 
         // 3. Execute on-chain verification readback
         try {
@@ -351,21 +440,31 @@ export default function DeploymentModal({
       } catch (receiptErr) {
         if (receiptErr?.name === "WaitForTransactionReceiptTimeoutError") {
           setIsConfirmationTimedOut(true);
+          // Timeout is NOT a terminal outcome: transaction remains pending
         } else {
-          setDeploymentState("failed");
           const msg = receiptErr?.shortMessage || receiptErr?.message || "";
-          if (
+          const isRevert =
             msg.toLowerCase().includes("revert") ||
-            receiptErr?.name === "TransactionReceiptRevertedError"
-          ) {
+            receiptErr?.name === "TransactionReceiptRevertedError";
+
+          if (isRevert) {
+            setDeploymentState("failed");
+            markTransactionSettled({
+              chainId: SEPOLIA_CHAIN_ID,
+              hash,
+              status: "reverted",
+            });
             setErrorMessage(
               "Transaction was reverted on-chain by the Ethereum Sepolia network. Gas was consumed but the contract was not deployed."
             );
           } else {
+            // Temporary RPC error or transient network issue:
+            // NOT a terminal outcome. Transaction remains pending on-chain!
+            setIsConfirmationTimedOut(true);
             setErrorMessage(
               receiptErr?.shortMessage ||
                 receiptErr?.message ||
-                "Failed waiting for transaction receipt on Sepolia."
+                "Temporary RPC issue waiting for transaction receipt on Sepolia. The transaction was broadcast and may still confirm on-chain."
             );
           }
         }
@@ -401,11 +500,23 @@ export default function DeploymentModal({
       if (receipt) {
         if (receipt.status === "reverted") {
           setDeploymentState("failed");
+          markTransactionSettled({
+            chainId: SEPOLIA_CHAIN_ID,
+            hash: txHash,
+            status: "reverted",
+            receipt,
+          });
           setErrorMessage("Transaction was reverted on-chain by the Ethereum Sepolia network.");
           setIsConfirmationTimedOut(false);
         } else if (receipt.contractAddress) {
           setDeployedAddress(receipt.contractAddress);
           setDeploymentState("confirmed");
+          markTransactionSettled({
+            chainId: SEPOLIA_CHAIN_ID,
+            hash: txHash,
+            status: "success",
+            receipt,
+          });
           setIsConfirmationTimedOut(false);
           // Run verification
           try {
@@ -568,6 +679,57 @@ export default function DeploymentModal({
     onClose();
   };
 
+  // Temporary opt-in diagnostic capture handler
+  const handleCaptureDiagnostics = useCallback(async () => {
+    setIsCapturingDiagnostics(true);
+    try {
+      const report = await captureDeploymentDiagnostics({
+        connector,
+        snapshot,
+        address,
+        gasEstimate,
+      });
+      setDiagnosticsReport(report);
+      setShowDiagnostics(true);
+      if (typeof window !== "undefined") {
+        console.info("[Dragoon Deployment Diagnostics]", report);
+      }
+    } catch (err) {
+      setDiagnosticsReport({
+        error: `Diagnostic capture failed: ${err?.message || String(err)}`,
+      });
+      setShowDiagnostics(true);
+    } finally {
+      setIsCapturingDiagnostics(false);
+    }
+  }, [connector, snapshot, address, gasEstimate]);
+
+  const handleCopyDiagnostics = () => {
+    if (!diagnosticsReport || typeof navigator === "undefined" || !navigator.clipboard) return;
+    navigator.clipboard.writeText(JSON.stringify(diagnosticsReport, null, 2)).then(() => {
+      setCopiedDiagnostics(true);
+      setTimeout(() => setCopiedDiagnostics(false), 2000);
+    });
+  };
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.__dragoonCaptureDiagnostics = async () => {
+      console.info("[Dragoon Diagnostics] Running live diagnostic capture...");
+      const report = await captureDeploymentDiagnostics({
+        connector,
+        snapshot,
+        address,
+        gasEstimate,
+      });
+      console.info("[Dragoon Diagnostics Report]", report);
+      return report;
+    };
+    return () => {
+      delete window.__dragoonCaptureDiagnostics;
+    };
+  }, [connector, snapshot, address, gasEstimate]);
+
   const isWrongNetwork = isConnected && chainId !== SEPOLIA_CHAIN_ID;
   const isPending = deploymentState === "awaiting-approval" || deploymentState === "forging";
 
@@ -577,7 +739,7 @@ export default function DeploymentModal({
     <div
       className="fixed inset-0 z-[100] overflow-y-auto bg-black/80 backdrop-blur-sm"
       onClick={(e) => {
-        if (e.target === e.currentTarget && !isPending) {
+        if (e.target === e.currentTarget && deploymentState !== "awaiting-approval") {
           onClose();
         }
       }}
@@ -617,7 +779,7 @@ export default function DeploymentModal({
                 Fixed-Supply ERC-20 • Chain ID 11155111
               </p>
             </div>
-            {!isPending && (
+            {deploymentState !== "awaiting-approval" && (
               <button
                 ref={closeButtonRef}
                 type="button"
@@ -655,8 +817,20 @@ export default function DeploymentModal({
               </div>
             )}
 
+            {/* Wallet Context Invalidation Notice */}
+            {isWalletContextChanged && deploymentState === "ready" && (
+              <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/50 text-xs text-amber-200">
+                <span className="font-semibold block text-amber-300">Wallet Context Changed</span>
+                <span>
+                  {!isConnected || !address
+                    ? "The wallet was disconnected while this review was open. The previous review has been invalidated. Please reconnect your wallet to review and deploy."
+                    : "The connected account, wallet provider, or network changed while this review was open. The previous review has been invalidated. Please review the updated specifications below before confirming."}
+                </span>
+              </div>
+            )}
+
             {/* Parameter Change Notice */}
-            {hasParametersChanged && deploymentState === "ready" && (
+            {!isWalletContextChanged && hasParametersChanged && deploymentState === "ready" && (
               <div className="p-3 rounded-xl bg-yellow-950/30 border border-yellow-500/40 text-xs text-yellow-200">
                 <span className="font-semibold block text-yellow-300">Blueprint Parameters Changed</span>
                 <span>The parameters in the form changed since opening this review. Please review the updated specifications below before confirming.</span>
@@ -715,8 +889,15 @@ export default function DeploymentModal({
                       <span className="text-forge-textMuted uppercase font-mono tracking-wider block">Recipient Wallet</span>
                       <span className="text-[10px] text-forge-textMuted">Receives 100% of supply</span>
                     </div>
-                    <span className="font-mono text-xs text-orange-300 truncate max-w-[200px]" title={address}>
-                      {address ? `${address.slice(0, 8)}...${address.slice(-6)}` : "Not connected"}
+                    <span
+                      className="font-mono text-xs text-orange-300 truncate max-w-[200px]"
+                      title={snapshot?.address || address || ""}
+                    >
+                      {snapshot?.address
+                        ? `${snapshot.address.slice(0, 8)}...${snapshot.address.slice(-6)}`
+                        : address
+                        ? `${address.slice(0, 8)}...${address.slice(-6)}`
+                        : "Not connected"}
                     </span>
                   </div>
                   <div className="flex justify-between items-baseline border-b border-forge-border pb-2.5">
@@ -1017,6 +1198,88 @@ export default function DeploymentModal({
                     </p>
                   )}
                 </div>
+              </div>
+            )}
+
+            {/* Opt-in Diagnostic Capture (Temporary) */}
+            {(deploymentState === "ready" || deploymentState === "failed") && (
+              <div className="pt-2 border-t border-forge-border/40">
+                {!showDiagnostics ? (
+                  <button
+                    type="button"
+                    onClick={handleCaptureDiagnostics}
+                    disabled={isCapturingDiagnostics}
+                    className="text-[11px] font-mono text-forge-textMuted hover:text-orange-400 transition-colors flex items-center gap-1.5 focus:outline-none"
+                  >
+                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                    </svg>
+                    <span>{isCapturingDiagnostics ? "Running Preflight Diagnostics..." : "Run Preflight Diagnostics"}</span>
+                  </button>
+                ) : (
+                  <div className="p-3 rounded-xl bg-forge-surfaceElevated border border-forge-border text-xs space-y-2.5 text-left">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-forge-textPrimary text-xs">Preflight Diagnostics</span>
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-orange-950/40 text-orange-400 border border-orange-500/30">
+                          Opt-in
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={handleCopyDiagnostics}
+                          className="px-2 py-0.5 rounded bg-forge-surfaceHighlight border border-forge-border text-forge-textSecondary hover:text-forge-textPrimary font-mono text-[11px]"
+                        >
+                          {copiedDiagnostics ? "Copied JSON" : "Copy JSON"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowDiagnostics(false)}
+                          className="text-forge-textMuted hover:text-forge-textPrimary text-[11px]"
+                        >
+                          Hide
+                        </button>
+                      </div>
+                    </div>
+
+                    {diagnosticsReport && (
+                      <div className="space-y-2 text-[11px]">
+                        <div className="grid grid-cols-2 gap-2 font-mono">
+                          <div className="p-2 rounded bg-forge-surfaceHighlight/50 border border-forge-border/60 space-y-0.5">
+                            <span className="text-forge-textMuted block text-[10px] uppercase font-sans">Observed Parameters</span>
+                            <span className="text-forge-textPrimary block truncate">Chain: {diagnosticsReport.network?.providerChainId}</span>
+                            <span className="text-forge-textPrimary block truncate">Gas Price: {diagnosticsReport.observedFeeParameters?.gasPriceGwei || "N/A"} Gwei</span>
+                            <span className="text-forge-textPrimary block truncate">Balance: {diagnosticsReport.observedBalance?.balanceEth ? `${Number(diagnosticsReport.observedBalance.balanceEth).toFixed(5)} ETH` : "N/A"}</span>
+                          </div>
+                          <div className="p-2 rounded bg-forge-surfaceHighlight/50 border border-forge-border/60 space-y-0.5">
+                            <span className="text-forge-textMuted block text-[10px] uppercase font-sans">Simulation & Estimates</span>
+                            <span className={`block font-semibold ${diagnosticsReport.freshRpcSimulations?.eth_call?.success ? "text-emerald-400" : "text-red-400"}`}>
+                              eth_call: {diagnosticsReport.freshRpcSimulations?.eth_call?.status || "N/A"}
+                            </span>
+                            <span className={`block font-semibold ${diagnosticsReport.freshRpcSimulations?.eth_estimateGas?.success ? "text-emerald-400" : "text-red-400"}`}>
+                              eth_estimateGas: {diagnosticsReport.freshRpcSimulations?.eth_estimateGas?.status || "N/A"}
+                            </span>
+                            {diagnosticsReport.feeAnalysis?.balanceSufficiency && (
+                              <span className={`block text-[10px] ${diagnosticsReport.feeAnalysis.balanceSufficiency.hasSufficientFundsForGas ? "text-emerald-400" : "text-amber-400"}`}>
+                                Funds: {diagnosticsReport.feeAnalysis.balanceSufficiency.marginType}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        <details className="cursor-pointer">
+                          <summary className="text-[10px] text-forge-textMuted hover:text-forge-textPrimary">
+                            View Raw Diagnostic Payload ({diagnosticsReport.deploymentPayload?.dataLengthBytes || 0} bytes calldata)
+                          </summary>
+                          <pre className="mt-1 p-2 rounded bg-black/60 border border-forge-border/40 text-[10px] text-forge-textSecondary font-mono overflow-x-auto max-h-40 overflow-y-auto">
+                            {JSON.stringify(diagnosticsReport, null, 2)}
+                          </pre>
+                        </details>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>
